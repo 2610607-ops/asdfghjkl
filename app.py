@@ -32,14 +32,17 @@ z_threshold = st.sidebar.slider(
 # 2. 데이터 수집 (OpenSky API)
 # -----------------------------------------------------------
 def get_flight_data():
-    # 문자열 끝의 잘못된 특수문자를 정상적인 큰따옴표(")로 변경했습니다.
     url = "https://opensky-network.org/api/states/all"
     params = {"lamin": 33.0, "lamax": 39.0, "lomin": 124.0, "lomax": 132.0}
     try:
-        response = requests.get(url, params=params, timeout=10)
+        # 수정됨: timeout을 10초에서 30초로 넉넉하게 늘렸습니다.
+        response = requests.get(url, params=params, timeout=30)
         data = response.json()
         if data is not None and data.get("states") is not None:
             return data["states"]
+        return []
+    except Exception as e:
+        st.error(f"데이터를 가져오는 중 오류가 발생했습니다: {e}")
         return []
     except Exception as e:
         st.error(f"데이터를 가져오는 중 오류가 발생했습니다: {e}")
