@@ -10,16 +10,21 @@ st.title("✈️ 한반도 상공 실시간 비행기 이상 탐지 웹앱")
 st.write("OpenSky API 데이터에 Z-score 통계 기법을 적용하여 급강하 중인 비행기를 자동으로 감지합니다.")
 
 # -----------------------------------------------------------
-# 1. 사이드바 UI 설정 (슬라이더 추가)
+# 0. OAuth2 인증 정보 설정 (★여기를 수정하세요★)
+# -----------------------------------------------------------
+TOKEN_URL = "https://opensky-network.org/oauth/token"
+# 본인의 실제 Client ID와 Secret 값을 아래에 정확히 넣어주세요.
+CLIENT_ID = "YOUR_CLIENT_ID"
+CLIENT_SECRET = 'YOUR_CLIENT_SECRET' # 내부에 따옴표가 있는 문자열일 수 있으므로 겉은 작은따옴표(')로 감싸는 것이 안전합니다.
+
+# -----------------------------------------------------------
+# 1. 사이드바 UI 설정
 # -----------------------------------------------------------
 st.sidebar.header("⚙️ 컨트롤 타워")
 refresh_button = st.sidebar.button("🔄 실시간 데이터 새로고침")
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("🚨 이상 탐지(Anomaly Detection) 설정")
-
-# 사용자가 직접 Z-score 기준값을 조절할 수 있는 슬라이더를 만듭니다.
-# 기본값은 통계학적 기준인 -3.0으로 설정합니다.
+st.sidebar.subheader("🚨 이상 탐지 설정")
 z_threshold = st.sidebar.slider(
     "급강하 감지 Z-score 기준값",
     min_value=-5.0,
@@ -29,28 +34,53 @@ z_threshold = st.sidebar.slider(
 )
 
 # -----------------------------------------------------------
-# 2. 데이터 수집 (OpenSky API)
+# 2. 토큰 발급 및 데이터 수집 (OAuth2 적용)
 # -----------------------------------------------------------
-def get_flight_data():
+
+# [핵심] 토큰 캐싱: 50분(3000초) 동안은 기존 토큰을 재사용하여 통신 부하를 줄입니다.
+@st.cache_data(ttl=3000)
+def get_oauth2_token(client_id, client_secret):
+    try:
+        data = {'grant_type': 'client_credentials'}
+        auth = (client_id, client_secret)
+        
+        # 토큰 서버로 요청을 보냅니다.
+        response = requests.post(TOKEN_URL, data=data, auth=auth, timeout=15)
+        response.raise_for_status()
+        
+        return response.json().get('access_token')
+    except Exception as e:
+        st.error(f"토큰 발급 실패 (인증 정보를 확인하세요): {e}")
+        return None
+
+# [핵심] 발급받은 토큰을 활용하여 데이터 요청
+def get_flight_data(token):
+    if not token:
+        return []
+        
     url = "https://opensky-network.org/api/states/all"
     params = {"lamin": 33.0, "lamax": 39.0, "lomin": 124.0, "lomax": 132.0}
     
-    # 여기에 가입하신 본인의 아이디와 비밀번호를 넣으세요!
-    username = "YOUR_USERNAME" 
-    password = "YOUR_PASSWORD"
+    # Bearer 방식으로 헤더에 토큰을 심어서 보냅니다. (이것이 봇 차단을 우회하는 열쇠입니다)
+    headers = {
+        'Authorization': f'Bearer {token}'
+    }
     
     try:
-        # auth=(username, password) 를 추가했습니다.
-        response = requests.get(url, params=params, auth=(username, password), timeout=30)
+        response = requests.get(url, params=params, headers=headers, timeout=30)
+        response.raise_for_status() # 401(권한 없음) 등의 에러가 나면 여기서 걸러집니다.
+        
         data = response.json()
         if data is not None and data.get("states") is not None:
             return data["states"]
         return []
     except Exception as e:
-        st.error(f"데이터를 가져오는 중 오류가 발생했습니다: {e}")
+        st.error(f"비행기 데이터 조회 중 오류가 발생했습니다: {e}")
         return []
 
-raw_data = get_flight_data()
+# 토큰을 먼저 받아온 뒤, 그 토큰으로 비행기 데이터를 조회합니다.
+access_token = get_oauth2_token(CLIENT_ID, CLIENT_SECRET)
+raw_data = get_flight_data(access_token)
 
 # -----------------------------------------------------------
 # 3. 데이터 전처리 및 Z-score 계산 (Pandas)
@@ -63,37 +93,27 @@ if len(raw_data) > 0:
     ]
     df = pd.DataFrame(raw_data, columns=columns)
     
-    # 수직 속도(vertical_rate)를 데이터 분석 대상에 포함시킵니다.
     df = df[['callsign', 'longitude', 'latitude', 'baro_altitude', 'velocity', 'vertical_rate']]
-    
-    # 위치 정보와 수직 속도가 없는 데이터는 지워줍니다.
     df = df.dropna(subset=['longitude', 'latitude', 'vertical_rate'])
     df['callsign'] = df['callsign'].astype(str).str.strip().replace('', '알 수 없음')
 
-    # --- [핵심 기능] Z-score 계산 ---
-    # 현재 한반도 상공 모든 비행기의 수직 속도 평균(mean)과 표준편차(std)를 구합니다.
     mean_vr = df['vertical_rate'].mean()
     std_vr = df['vertical_rate'].std()
     
-    # 만약 비행기가 너무 적어서 표준편차가 0이 되는 경우를 대비한 안전 장치입니다.
     if std_vr > 0:
         df['z_score'] = (df['vertical_rate'] - mean_vr) / std_vr
     else:
         df['z_score'] = 0.0
 
-    # 사용자가 설정한 슬라이더 기준값(z_threshold) 이하이면 '위험(급강하)', 아니면 '정상'으로 분류합니다.
     df['status'] = df['z_score'].apply(lambda z: '위험(급강하)' if z <= z_threshold else '정상')
 
-    # --- [시각화 꿀팁] 상태에 따른 색상 부여 ---
-    # 정상 비행기는 노란색[255, 200, 0], 위험 비행기는 빨간색[255, 0, 0]으로 지정합니다.
     def assign_color(status):
         if status == '위험(급강하)':
-            return [255, 0, 0, 255] # 빨간색 (R, G, B, A)
-        return [255, 200, 0, 180]    # 노란색
+            return [255, 0, 0, 255]
+        return [255, 200, 0, 180]
         
     df['color'] = df['status'].apply(assign_color)
 
-    # 대시보드 요약 정보 표시
     diving_count = len(df[df['status'] == '위험(급강하)'])
     st.sidebar.success(f"현재 추적 비행기: {len(df)}대")
     if diving_count > 0:
@@ -106,7 +126,6 @@ if len(raw_data) > 0:
     # -----------------------------------------------------------
     view_state = pdk.ViewState(latitude=36.0, longitude=128.0, zoom=6, pitch=45)
 
-    # get_fill_color에 고정된 값이 아닌, 위에서 우리가 만든 'color' 컬럼을 연동합니다.
     layer = pdk.Layer(
         "ScatterplotLayer",
         data=df,
@@ -116,7 +135,6 @@ if len(raw_data) > 0:
         pickable=True
     )
 
-    # 툴팁에 Z-score와 현재 상태, 수직속도 정보를 추가하여 사용자가 확인할 수 있게 합니다.
     tooltip = {
         "html": """
         <b>콜사인:</b> {callsign} <br/>
@@ -149,4 +167,4 @@ if len(raw_data) > 0:
         
     st.dataframe(df[['callsign', 'status', 'z_score', 'vertical_rate', 'baro_altitude', 'velocity']])
 else:
-    st.warning("현재 한반도 상공에서 감지된 비행기 데이터가 없습니다. (잠시 후 다시 시도해보세요)")
+    st.warning("현재 한반도 상공에서 감지된 비행기 데이터가 없거나 서버와 연결할 수 없습니다.")
